@@ -1,0 +1,100 @@
+name: Publish CGL+ Android releases
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "AVai/**"
+      - "Friend/**"
+      - ".github/workflows/publish-android-release.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build, verify and publish AVai + Friend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Require the stable CGL+ Android signing key
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.CGLPLUS_ANDROID_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$DEBUG_KEYSTORE_B64" ]; then
+            echo "::error::Add the CGLPLUS_ANDROID_DEBUG_KEYSTORE_BASE64 repository secret before publishing updates."
+            echo "The same keystore must sign every release so Android accepts in-place updates."
+            exit 1
+          fi
+          mkdir -p "$HOME/.android"
+          printf '%s' "$DEBUG_KEYSTORE_B64" | base64 --decode > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+          keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK Platform 36
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Build AVai
+        working-directory: AVai
+        run: gradle --no-daemon :app:assembleDebug
+
+      - name: Build Friend
+        working-directory: Friend
+        run: ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Prepare APKs and update metadata
+        run: |
+          mkdir -p release
+          cp AVai/app/build/outputs/apk/debug/app-debug.apk release/AVai.apk
+          cp Friend/app/build/outputs/apk/debug/app-debug.apk release/Friend.apk
+          cd release
+          sha256sum AVai.apk Friend.apk > checksums.txt
+          AVAI_VERSION_CODE=$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' ../AVai/app/build.gradle.kts | head -1)
+          AVAI_VERSION_NAME=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' ../AVai/app/build.gradle.kts | head -1)
+          FRIEND_VERSION_CODE=$(sed -n 's/.*versionCode = \([0-9]*\).*/\1/p' ../Friend/app/build.gradle.kts | head -1)
+          FRIEND_VERSION_NAME=$(sed -n 's/.*versionName = "\([^"]*\)".*/\1/p' ../Friend/app/build.gradle.kts | head -1)
+          AVAI_SHA=$(awk '$2=="AVai.apk"{print $1}' checksums.txt)
+          FRIEND_SHA=$(awk '$2=="Friend.apk"{print $1}' checksums.txt)
+          jq -n \
+            --argjson avaiCode "$AVAI_VERSION_CODE" \
+            --arg avaiName "$AVAI_VERSION_NAME" \
+            --arg avaiSha "$AVAI_SHA" \
+            --argjson friendCode "$FRIEND_VERSION_CODE" \
+            --arg friendName "$FRIEND_VERSION_NAME" \
+            --arg friendSha "$FRIEND_SHA" \
+            '{schemaVersion:1,apps:[
+              {id:"cgl-avai",packageName:"com.cgl.avai",versionCode:$avaiCode,versionName:$avaiName,apk:"AVai.apk",sha256:$avaiSha},
+              {id:"cgl-friend",packageName:"com.cgl.friend",versionCode:$friendCode,versionName:$friendName,apk:"Friend.apk",sha256:$friendSha}
+            ]}' > release.json
+
+      - name: Publish latest stable update channel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view android-latest >/dev/null 2>&1; then
+            gh release edit android-latest --title "CGL+ Android latest" --notes-file release/release.json
+            gh release upload android-latest release/AVai.apk release/Friend.apk release/checksums.txt --clobber
+          else
+            gh release create android-latest release/AVai.apk release/Friend.apk release/checksums.txt \
+              --target "$GITHUB_SHA" \
+              --title "CGL+ Android latest" \
+              --notes-file release/release.json \
+              --prerelease
+          fi
