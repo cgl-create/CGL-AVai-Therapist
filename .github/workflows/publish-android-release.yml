@@ -7,7 +7,6 @@ on:
     paths:
       - "AVai/**"
       - "Friend/**"
-      - ".github/workflows/publish-android-release.yml"
 
 permissions:
   contents: write
